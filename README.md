@@ -198,6 +198,107 @@ Lists that are specified under a key in a dictionary use the key as a tag for ea
 
 ### xmltodict.parse()
 
+Parse an XML document into a dictionary. See
+[XML Schema Instance (xsi) typed mode](#xml-schema-instance-xsi-typed-mode)
+for the optional typed mode.
+
+- `xsi_types=False`: When `True`, interpret `xsi:type`/`xsi:nil` and return typed values (not compatible with `process_namespaces=True`).
+- `xsi_strict=False`: When `True` (together with `xsi_types=True`), raise `ValueError` for unrecognized `xsi:type` values instead of keeping the raw text.
+
+### xmltodict.unparse()
+
+Convert a Python dictionary back into XML.
+
+- `input_dict`: Dictionary to convert to XML.
+- `output=None`: File-like object to write XML to; returns string if None.
+- `encoding='utf-8'`: Encoding of the output XML.
+- `bytes_errors='replace'`: Error handler used when decoding byte values during unparse (for example `'replace'`, `'strict'`, `'ignore'`).
+- `full_document=True`: Include XML declaration if True.
+- `short_empty_elements=False`: Use short tags for empty elements (`<tag/>`).
+- `attr_prefix='@'`: Prefix for dictionary keys representing attributes.
+- `cdata_key='#text'`: Key for text content in the dictionary.
+- `pretty=False`: Pretty-print the XML output. This adds indentation/newlines for readability, so it should generally not be combined with parsed whitespace-preserving content when exact round-tripping matters.
+- `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
+- `newl='\n'`: Newline character for pretty printing.
+- `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `xsi_types=False`: When `True`, write `XsiValue` markers back as `xsi:type`/`xsi:nil` attributes and type native Python values automatically.
+
+> **Note:** When building XML from dictionaries, keys whose values are empty
+> lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
+> placeholder child (for example, `{'a': ['']}`) if an explicit empty container
+> element is required in the output.
+
+Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
+
+## XML Schema Instance (xsi) typed mode
+
+Pass ``xsi_types=True`` to interpret ``xsi:type`` and ``xsi:nil``
+attributes from the XML Schema Instance namespace
+(``http://www.w3.org/2001/XMLSchema-instance``). The namespace prefixes do
+not have to be named ``xsi``/``xsd`` — they are resolved from the in-scope
+``xmlns`` declarations.
+
+```python
+>>> import xmltodict
+>>> xml = '''<root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+...               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+...   <count xsi:type="xsd:integer">42</count>
+...   <active xsi:type="xsd:boolean">false</active>
+...   <price xsi:type="xsd:decimal">3.140</price>
+...   <when xsi:type="xsd:dateTime">2026-10-02T13:45:30+08:00</when>
+...   <blob xsi:type="xsd:base64Binary">aGVsbG8=</blob>
+...   <missing xsi:nil="true"/>
+... </root>'''
+>>> doc = xmltodict.parse(xml, xsi_types=True)
+>>> doc['root']['count']
+XsiValue(42, 'integer')
+>>> doc['root']['price'].value
+Decimal('3.140')
+>>> doc['root']['missing']
+XsiValue(None, nil=True)
+```
+
+Supported built-in types and their Python representations:
+
+- ``xsd:string`` → ``str`` (whitespace preserved verbatim)
+- ``xsd:boolean`` → ``bool``; only ``true``/``false``/``1``/``0`` are
+  accepted, so values like ``"false"`` never suffer from Python's
+  ``bool('false') == True`` trap
+- ``xsd:integer`` → ``int``
+- ``xsd:decimal`` → ``decimal.Decimal`` (scale is preserved)
+- ``xsd:dateTime`` → timezone-aware ``datetime.datetime`` (naive values
+  stay naive; ``Z`` means UTC)
+- ``xsd:base64Binary`` → ``bytes``
+
+For the non-string types, leading/trailing whitespace is stripped and
+internal runs of tabs/newlines/spaces are collapsed per the XSD lexical
+rules; invalid lexical values raise ``ValueError``.
+
+Three states are represented independently:
+
+- node absent → key missing
+- empty element (``<a/>`` or ``<a></a>``) → ``None``
+- explicit nil (``<a xsi:nil="true"/>``) → ``XsiValue(None, nil=True)``
+
+An element that is both ``xsi:nil="true"`` and non-empty (text or child
+elements) is rejected with ``ValueError``. Unrecognized ``xsi:type``
+values keep their raw text in an ``XsiValue`` carrying the original type
+token; pass ``xsi_strict=True`` to raise instead.
+
+``unparse(..., xsi_types=True)`` writes the markers back. Native Python
+values are also typed automatically (``bool``, ``int``, ``Decimal``,
+``datetime``, ``bytes``), and missing XSI/XSD namespace declarations are
+added on the root element using the ``xsi``/``xsd`` prefixes:
+
+```python
+>>> print(xmltodict.unparse(doc, xsi_types=True, full_document=False))
+<root xmlns:xsi="..." xmlns:xsd="..."><count xsi:type="xsd:integer">42</count>...
+```
+
+The default behavior is unchanged: without ``xsi_types=True``, ``parse``
+still returns plain text strings and dictionaries. This option is not
+compatible with ``process_namespaces=True``.
+
 Parse XML input into a Python dictionary.
 
 - `xml_input`: XML input as a string, file-like object, or generator of strings.
@@ -221,29 +322,6 @@ Parse XML input into a Python dictionary.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
 
-### xmltodict.unparse()
-
-Convert a Python dictionary back into XML.
-
-- `input_dict`: Dictionary to convert to XML.
-- `output=None`: File-like object to write XML to; returns string if None.
-- `encoding='utf-8'`: Encoding of the output XML.
-- `bytes_errors='replace'`: Error handler used when decoding byte values during unparse (for example `'replace'`, `'strict'`, `'ignore'`).
-- `full_document=True`: Include XML declaration if True.
-- `short_empty_elements=False`: Use short tags for empty elements (`<tag/>`).
-- `attr_prefix='@'`: Prefix for dictionary keys representing attributes.
-- `cdata_key='#text'`: Key for text content in the dictionary.
-- `pretty=False`: Pretty-print the XML output. This adds indentation/newlines for readability, so it should generally not be combined with parsed whitespace-preserving content when exact round-tripping matters.
-- `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
-- `newl='\n'`: Newline character for pretty printing.
-- `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
-
-> **Note:** When building XML from dictionaries, keys whose values are empty
-> lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
-> placeholder child (for example, `{'a': ['']}`) if an explicit empty container
-> element is required in the output.
-
-Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
 
 ## Examples
 
