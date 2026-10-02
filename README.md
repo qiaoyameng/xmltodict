@@ -194,6 +194,92 @@ Lists that are specified under a key in a dictionary use the key as a tag for ea
 </line>
 ```
 
+## XSI typed mode
+
+XML services frequently signal values with the XML Schema Instance
+namespace: `<amount xsi:nil="true"/>` means "no value" and is different from
+an empty element `<amount/>`, while `xsi:type` names the actual datatype of
+the text. Because the default mode only returns strings and dicts, this is
+opt-in: pass `xsi_types=True` to both `parse()` and `unparse()`. The xsi
+prefix is resolved from the in-scope `xmlns` declarations, so it does not
+have to be literally `xsi`.
+
+### Parsing
+
+```python
+>>> xml = (
+...     '<root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+...     '       xmlns:xsd="http://www.w3.org/2001/XMLSchema">'
+...     '  <amount xsi:nil="true"/>'
+...     '  <empty></empty>'
+...     '  <active xsi:type="xsd:boolean">true</active>'
+...     '  <count xsi:type="xsd:integer">42</count>'
+...     '  <price xsi:type="xsd:decimal">19.99</price>'
+...     '  <when xsi:type="xsd:dateTime">2026-10-02T13:45:30+08:00</when>'
+...     '  <blob xsi:type="xsd:base64Binary">aGVsbG8=</blob>'
+...     '</root>'
+... )
+>>> d = parse(xml, xsi_types=True)['root']
+>>> d['amount'] is None
+True
+>>> d['empty']
+''
+>>> d['active'], type(d['active'])
+(True, <class 'bool'>)
+>>> d['count'], d['price']
+(42, Decimal('19.99'))
+>>> d['when'].utcoffset()
+datetime.timedelta(seconds=28800)
+>>> d['blob']
+b'hello'
+```
+
+The supported built-in types and their Python mappings are:
+
+| XSD type | Python type |
+| --- | --- |
+| `string` | `str` (whitespace preserved) |
+| `boolean` | `bool`; only `true`/`false`/`1`/`0` are accepted |
+| `integer` | `int` |
+| `decimal` | `decimal.Decimal` |
+| `dateTime` | `datetime.datetime` (timezone info is kept) |
+| `base64Binary` | `bytes` (XML whitespace is ignored) |
+
+Whitespace follows the XSD lexical rules of each type; values are never
+coerced with implicit Python casts such as `bool('false')`. An element
+marked `xsi:nil="true"` that also contains non-whitespace text or child
+elements raises `ValueError`. In typed mode an empty element (`<b/>`)
+becomes `''`, so nilled values (`None`), empty text (`''`) and missing
+nodes (key absent) stay independently representable.
+
+Types outside the supported set keep their original text in an
+`xmltodict.XsiValue(value, type_name)` wrapper by default. Pass
+`xsi_unknown_types="error"` to reject them with a `ValueError` instead:
+
+```python
+>>> parse('<a xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+...       '   xmlns:z="http://example.com/z">'
+...       '  <b xsi:type="z:thing">raw</b></a>', xsi_types=True)['a']['b']
+XsiValue('raw', 'z:thing')
+```
+
+### Unparsing and round-tripping
+
+With `unparse(..., xsi_types=True)`, native values are serialized with the
+matching `xsi:type`, `None` becomes an `xsi:nil="true"` element, and
+`XsiValue` forces an explicit marker (including round-tripped unknown
+types). Prefixes already declared in the root `@xmlns` mapping are reused;
+override them with `xsi_prefix` / `xsd_prefix`.
+
+```python
+>>> unparse({'root': {'count': 42, 'amount': None, 'name': ''}},
+...         xsi_types=True)
+"<?xml version='...' encoding='utf-8'?>\\n<root ...><count xsi:type=\\"xsd:integer\\">42</count><amount xsi:nil=\\"true\\"></amount><name></name></root>"
+```
+
+Without `xsi_types`, parsing and unparsing behave exactly as before and
+return only the original strings and dictionaries.
+
 ## API Reference
 
 ### xmltodict.parse()
@@ -220,6 +306,8 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `xsi_types=False`: Interpret the XML Schema Instance namespace. `xsi:nil="true"` becomes `None`, empty elements become `''`, and `xsi:type` converts `string`/`boolean`/`integer`/`decimal`/`dateTime`/`base64Binary` text to native Python values. The xsi prefix is taken from in-scope xmlns declarations (it does not have to be `xsi`). A nilled element with non-whitespace content raises `ValueError`.
+- `xsi_unknown_types='keep'`: What to do with an `xsi:type` outside the supported built-ins. `'keep'` returns an `XsiValue(value, type_name)` holding the raw text and QName; `'error'` raises `ValueError`.
 
 ### xmltodict.unparse()
 
@@ -237,6 +325,8 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `xsi_types=False`: Emit XSI markers. Native `bool`/`int`/`Decimal`/`datetime`/`bytes` values get an `xsi:type`, `None` becomes `xsi:nil="true"`, and `XsiValue` keeps an explicit marker; `''` still produces a plain empty element and missing keys produce no element.
+- `xsi_prefix=None` / `xsd_prefix=None`: Prefixes for the synthesized `xsi:nil`/`xsi:type` attributes and built-in type names. Defaults to the prefixes declared in the root `@xmlns` mapping, or `xsi`/`xsd`.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
