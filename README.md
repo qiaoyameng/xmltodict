@@ -74,6 +74,44 @@ It also lets you collapse certain namespaces to shorthand prefixes, or skip them
 True
 ```
 
+### Preserving nested namespace context
+
+A single global URI-to-prefix map cannot describe namespaces that are
+rebound on nested elements, undeclared with `xmlns=""`, or bound to several
+prefixes in different subtrees. Pass `preserve_namespace_context=True` to
+keep every element on its expanded `URI:local` name together with the xmlns
+declarations present on that element:
+
+```python
+>>> xml = """
+... <root xmlns="urn:default" xmlns:a="urn:a">
+...   <a:child xmlns:a="urn:b"><a:grand a:attr="1"/></a:child>
+...   <undeclare xmlns=""><deep/></undeclare>
+... </root>
+... """
+>>> doc = xmltodict.parse(xml, process_namespaces=True,
+...                       preserve_namespace_context=True)
+>>> doc['urn:default:root']['urn:b:child']['@xmlns']
+{'a': 'urn:b'}
+>>> doc['urn:default:root']['undeclare']['@xmlns']
+{'': None}
+```
+
+Serialize with the matching `unparse` option to restore legal scoping.
+Unprefixed attributes are never placed in the default namespace, and nodes
+you add or modify get non-colliding prefix declarations when no in-scope
+prefix applies:
+
+```python
+>>> doc['urn:default:root']['urn:new:added'] = {'@urn:x:q': 'v'}
+>>> xmltodict.unparse(doc, preserve_namespace_context=True)
+'<?xml version="en...?>...<ns0:added xmlns:ns0="urn:new" xmlns:ns1="urn:x" ns1:q="v"/>...'
+```
+
+This option requires expanded names and cannot be combined with the
+`namespaces` collapse map on `parse`; on `unparse` that map is only used as a
+preferred-prefix hint.
+
 ## Streaming mode
 
 `xmltodict` is very fast ([Expat](http://docs.python.org/library/pyexpat.html)-based) and has a streaming mode with a small memory footprint, suitable for big XML dumps like [Discogs](http://discogs.com/data/) or [Wikipedia](http://dumps.wikimedia.org/):
@@ -205,6 +243,7 @@ Parse XML input into a Python dictionary.
 - `expat=expat`: XML parser module to use.
 - `process_namespaces=False`: Expand XML namespaces if True.
 - `namespace_separator=':'`: Separator between namespace URI and local name.
+- `preserve_namespace_context=False`: Keep expanded `URI<separator>local` names together with per-element xmlns declarations, capturing nested prefix rebinding and default-namespace undeclaration for scope-aware `unparse`. Requires `process_namespaces=True` and cannot be combined with the `namespaces` collapse map.
 - `disable_entities=True`: Disable entity parsing for security.
 - `process_comments=False`: Include XML comments if True. Comments can be preserved when enabled, but by default they are ignored. Multiple top-level comments may not be preserved in exact order.
 - `xml_attribs=True`: Include attributes in output dict (with `attr_prefix`).
@@ -234,6 +273,7 @@ Convert a Python dictionary back into XML.
 - `attr_prefix='@'`: Prefix for dictionary keys representing attributes.
 - `cdata_key='#text'`: Key for text content in the dictionary.
 - `pretty=False`: Pretty-print the XML output. This adds indentation/newlines for readability, so it should generally not be combined with parsed whitespace-preserving content when exact round-tripping matters.
+- `preserve_namespace_context=False`: Resolve expanded `URI:local` keys against a namespace scope stack using the preserved per-element xmlns declarations; generates non-colliding prefix declarations for new or modified nodes. The `namespaces` map is only used as a preferred-prefix hint.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).

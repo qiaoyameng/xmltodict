@@ -29,6 +29,7 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        preserve_namespace_context=False,
     ):
         self.path = []
         self.stack = []
@@ -49,6 +50,7 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.preserve_namespace_context = preserve_namespace_context
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -77,10 +79,13 @@ class _DictSAXHandler:
     def startElement(self, full_name, attrs):
         name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
+        xmlns = None
         if self.namespace_declarations:
             if not attrs:
                 attrs = self.dict_constructor()
-            attrs['xmlns'] = self.namespace_declarations
+            xmlns = self.namespace_declarations
+            if self.xml_attribs:
+                attrs['xmlns'] = xmlns
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
         if len(self.path) >= self.item_depth:
@@ -96,6 +101,11 @@ class _DictSAXHandler:
                     if entry:
                         attr_entries.append(entry)
                 attrs = self.dict_constructor(attr_entries)
+            elif xmlns is not None:
+                # Keep per-element namespace declarations available even when
+                # regular attributes are not recorded.
+                attrs = self.dict_constructor(
+                    ((self.attr_prefix + 'xmlns', xmlns),))
             else:
                 attrs = None
             self.item = attrs or None
@@ -206,7 +216,8 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          preserve_namespace_context=False, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -342,14 +353,31 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    If `preserve_namespace_context` is `True` (requires
+    `process_namespaces=True`), elements and attributes are keyed by their
+    expanded ``URI<separator>local`` names and every element keeps the xmlns
+    declarations present on it (an undeclared default namespace is recorded as
+    ``None``). This captures nested namespace rebinding that a single global
+    URI-to-prefix map cannot express. Feed the result to
+    ``unparse(..., preserve_namespace_context=True)`` to regenerate legal,
+    correctly scoped declarations, even after modifying or adding namespaced
+    nodes. Expanded names are not collapsed, so the `namespaces` collapse map
+    cannot be combined with this option. The declarations are retained even
+    when `xml_attribs` is `False`.
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              preserve_namespace_context=preserve_namespace_context,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
         xml_input = xml_input.encode(encoding)
     if not process_namespaces:
         namespace_separator = None
+    elif preserve_namespace_context and kwargs.get('namespaces') is not None:
+        raise ValueError(
+            'preserve_namespace_context requires expanded names; the '
+            'namespaces collapse map cannot be combined with it')
     parser = expat.ParserCreate(
         encoding,
         namespace_separator
@@ -447,6 +475,152 @@ def _process_namespace(name, namespaces, ns_sep=':', attr_prefix='@'):
     return name
 
 
+def _split_expanded_name(name, ns_sep=':'):
+    """Split an expanded ``URI<sep>local`` name without assuming only one
+    separator occurs: namespace URIs may themselves contain the separator.
+    Returns ``(None, name)`` when no namespace part is present.
+    """
+    if not isinstance(name, str):
+        return None, name
+    i = name.rfind(ns_sep)
+    if i == -1:
+        return None, name
+    return name[:i], name[i + 1:]
+
+
+class _NamespaceScope:
+    """In-scope namespace bindings used while unparsing expanded names.
+
+    The scope mirrors XML namespace inheritance: each element receives a
+    clone of its parent's bindings, applies its own declarations, and the
+    parent state is restored when the element closes.
+    """
+
+    #: Prefixes predefined by the XML Namespaces spec; never synthesized.
+    _BUILTIN_PREFIXES = {
+        'xml': 'http://www.w3.org/XML/1998/namespace',
+        'xmlns': 'http://www.w3.org/2000/xmlns/',
+    }
+
+    def __init__(self, preferred=None, ns_sep=':', declared_prefixes=None):
+        # URI -> preferred prefix hints (e.g. the legacy ``namespaces`` map)
+        self.preferred = dict(preferred or {})
+        # Every prefix that appears in a preserved xmlns declaration in the
+        # whole document; synthesized prefixes must avoid these names.
+        self.declared_prefixes = set(declared_prefixes or ())
+        # prefix -> URI for the currently open elements (None undeclares)
+        self.bindings = {}
+        # URI -> set of prefixes bound to it in scope
+        self.uri_prefixes = {}
+        prefix, uri = 'xml', self._BUILTIN_PREFIXES['xml']
+        self.bindings[prefix] = uri
+        self.uri_prefixes.setdefault(uri, set()).add(prefix)
+
+    def clone(self):
+        child = _NamespaceScope(
+            preferred=self.preferred,
+            declared_prefixes=self.declared_prefixes,
+        )
+        child.bindings = dict(self.bindings)
+        child.uri_prefixes = {
+            uri: set(prefixes) for uri, prefixes in self.uri_prefixes.items()
+        }
+        return child
+
+    def declare(self, prefix, uri):
+        """Apply an xmlns declaration on the current element.
+
+        ``uri`` of None/'' undeclares the binding (``xmlns=""``).
+        """
+        prefix = prefix or ''
+        if uri:
+            old_uri = self.bindings.get(prefix)
+            if old_uri is not None and prefix in self.uri_prefixes.get(old_uri, ()):
+                self.uri_prefixes[old_uri].discard(prefix)
+            self.bindings[prefix] = uri
+            self.uri_prefixes.setdefault(uri, set()).add(prefix)
+        else:
+            old_uri = self.bindings.pop(prefix, None)
+            if old_uri is not None:
+                self.uri_prefixes.get(old_uri, set()).discard(prefix)
+
+    def is_default_no_namespace(self):
+        return self.bindings.get('') is None
+
+    def _candidate_usable(self, candidate, uri, allow_default):
+        if candidate == '' and not allow_default:
+            return False
+        bound = self.bindings.get(candidate)
+        if bound is not None and bound != uri:
+            return False
+        return True
+
+    def _synthesize(self, uri):
+        base = 'ns0'
+        candidate = base
+        counter = 0
+        while (candidate in self.bindings and self.bindings[candidate] != uri
+               or candidate in self.declared_prefixes
+               or candidate in self._BUILTIN_PREFIXES):
+            counter += 1
+            candidate = f'ns{counter}'
+        return candidate
+
+    def ensure(self, uri, allow_default):
+        """Return ``(qname_part, declared)`` for a reference to ``uri``.
+
+        ``declared`` is True when a fresh xmlns declaration must be emitted on
+        the referencing element. Attributes pass ``allow_default=False`` since
+        unprefixed attributes never belong to the default namespace.
+        """
+        existing = self.uri_prefixes.get(uri)
+        candidates = []
+        if existing:
+            candidates.extend(sorted(existing))
+        hint = self.preferred.get(uri)
+        if hint:
+            candidates.append(hint)
+        if allow_default:
+            candidates.append('')
+        for candidate in candidates:
+            if self._candidate_usable(candidate, uri, allow_default):
+                bound = self.bindings.get(candidate)
+                if bound == uri:
+                    return candidate, False
+                self.declare(candidate, uri)
+                return candidate, True
+        candidate = self._synthesize(uri)
+        self.declare(candidate, uri)
+        return candidate, True
+
+
+def _collect_xmlns_prefixes(value, attr_prefix, cdata_key):
+    """Collect every prefix used in a preserved @xmlns declaration so that
+    synthesized prefixes never collide with them.
+    """
+    prefixes = set()
+
+    def visit(node_value):
+        if isinstance(node_value, list):
+            for item in node_value:
+                visit(item)
+            return
+        if not isinstance(node_value, dict):
+            return
+        xmlns = node_value.get(attr_prefix + 'xmlns')
+        if isinstance(xmlns, dict):
+            prefixes.update(prefix or '' for prefix in xmlns)
+        for child_key, child_value in node_value.items():
+            if isinstance(child_key, str) and (
+                    child_key == cdata_key
+                    or child_key.startswith(attr_prefix)):
+                continue
+            visit(child_value)
+
+    visit(value)
+    return prefixes
+
+
 def _emit(key, value, content_handler,
           attr_prefix='@',
           cdata_key='#text',
@@ -461,7 +635,9 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          preserve_namespace_context=False,
+          ns_scope=None):
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -481,14 +657,16 @@ def _emit(key, value, content_handler,
                 content_handler.ignorableWhitespace(newl)
         return
 
-    key = _process_namespace(key, namespaces, namespace_separator, attr_prefix)
+    if not preserve_namespace_context:
+        key = _process_namespace(key, namespaces, namespace_separator, attr_prefix)
     if preprocessor is not None:
         result = preprocessor(key, value)
         if result is None:
             return
         key, value = result
     # Minimal validation to avoid breaking out of tag context
-    _validate_name(key, "element")
+    if not preserve_namespace_context:
+        _validate_name(key, "element")
     if not hasattr(value, '__iter__') or isinstance(value, (str, bytes, bytearray, memoryview, dict)):
         value = [value]
     for index, v in enumerate(value):
@@ -506,6 +684,46 @@ def _emit(key, value, content_handler,
         cdata = None
         attrs = {}
         children = []
+        if preserve_namespace_context:
+            element_ns, element_local = _split_expanded_name(
+                key, namespace_separator)
+            # Clone on entry so that declarations made for this occurrence
+            # never leak onto siblings (including repeated list occurrences).
+            scope = ns_scope.clone() if ns_scope is not None else _NamespaceScope(
+                namespaces, namespace_separator)
+            xmlns_decls = v.get(attr_prefix + 'xmlns') if isinstance(v, dict) else None
+            if isinstance(xmlns_decls, dict):
+                for decl_prefix, decl_uri in xmlns_decls.items():
+                    _validate_name(decl_prefix or '', "namespace prefix")
+                    resolved_uri = (
+                        None if decl_uri is None
+                        else _convert_value_to_string(
+                            decl_uri, encoding=encoding,
+                            bytes_errors=bytes_errors) or None)
+                    scope.declare(decl_prefix or '', resolved_uri)
+                    # XML 1.0 only permits undeclaring the default namespace
+                    # (xmlns=""); a prefixed xmlns:p="" is not well-formed, so
+                    # update the scope without emitting such an attribute.
+                    if not decl_prefix or resolved_uri is not None:
+                        attrs['xmlns{}'.format(
+                            f':{decl_prefix}' if decl_prefix else '')] = (
+                            '' if resolved_uri is None
+                            else resolved_uri)
+            if element_ns is None:
+                qname = element_local
+                if not scope.is_default_no_namespace():
+                    # In scope of a default namespace: undeclare it so that
+                    # the unprefixed element stays in no namespace.
+                    scope.declare('', None)
+                    attrs['xmlns'] = ''
+            else:
+                prefix, declared = scope.ensure(element_ns, True)
+                qname = element_local if prefix == '' \
+                    else f'{prefix}:{element_local}'
+                if declared:
+                    attrs['xmlns{}'.format(
+                        f':{prefix}' if prefix else '')] = element_ns
+            _validate_name(qname, "element")
         for ik, iv in v.items():
             if ik == cdata_key:
                 if iv is None:
@@ -513,9 +731,14 @@ def _emit(key, value, content_handler,
                 else:
                     cdata = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
                 continue
+            if preserve_namespace_context and isinstance(ik, str) \
+                    and ik == attr_prefix + 'xmlns':
+                # Already handled when establishing the element scope.
+                continue
             if isinstance(ik, str) and ik.startswith(attr_prefix):
-                ik = _process_namespace(ik, namespaces, namespace_separator,
-                                        attr_prefix)
+                if not preserve_namespace_context:
+                    ik = _process_namespace(ik, namespaces, namespace_separator,
+                                            attr_prefix)
                 if ik == attr_prefix + 'xmlns' and isinstance(iv, dict):
                     for k, v in iv.items():
                         _validate_name(k, "attribute")
@@ -528,7 +751,25 @@ def _emit(key, value, content_handler,
                     iv = ''
                 elif not isinstance(iv, str):
                     iv = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
-                attr_name = ik[len(attr_prefix) :]
+                if preserve_namespace_context:
+                    attr_key = ik[len(attr_prefix):]
+                    attr_ns, attr_local = _split_expanded_name(
+                        attr_key, namespace_separator)
+                    if attr_ns is None:
+                        attr_name = attr_local
+                    else:
+                        # Unprefixed attributes never inherit the default
+                        # namespace, so a prefix is mandatory here.
+                        attr_prefix_used, attr_declared = scope.ensure(
+                            attr_ns, False)
+                        attr_name = (
+                            f'{attr_prefix_used}:{attr_local}'
+                            if attr_prefix_used else attr_local)
+                        if attr_declared:
+                            attrs['xmlns:{}'.format(
+                                attr_prefix_used)] = attr_ns
+                else:
+                    attr_name = ik[len(attr_prefix) :]
                 _validate_name(attr_name, "attribute")
                 attrs[attr_name] = iv
                 continue
@@ -539,7 +780,9 @@ def _emit(key, value, content_handler,
             indent = ' ' * indent
         if pretty:
             content_handler.ignorableWhitespace(depth * indent)
-        content_handler.startElement(key, AttributesImpl(attrs))
+        content_handler.startElement(
+            qname if preserve_namespace_context else key,
+            AttributesImpl(attrs))
         if pretty and children:
             content_handler.ignorableWhitespace(newl)
         for child_key, child_value in children:
@@ -548,12 +791,15 @@ def _emit(key, value, content_handler,
                   pretty, newl, indent, namespaces=namespaces,
                   namespace_separator=namespace_separator,
                   expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
+                  bytes_errors=bytes_errors, comment_key=comment_key,
+                  preserve_namespace_context=preserve_namespace_context,
+                  ns_scope=scope if preserve_namespace_context else None)
         if cdata is not None:
             content_handler.characters(cdata)
         if pretty and children:
             content_handler.ignorableWhitespace(depth * indent)
-        content_handler.endElement(key)
+        content_handler.endElement(
+            qname if preserve_namespace_context else key)
         if pretty and depth:
             content_handler.ignorableWhitespace(newl)
 
@@ -586,12 +832,38 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     The `bytes_errors` parameter controls decoding errors for byte values and
     defaults to `'replace'`.
 
+    Pass ``preserve_namespace_context=True`` to serialize expanded
+    ``URI:local`` keys using the per-element ``@xmlns`` declarations produced
+    by :func:`parse` with the same option. A stack of namespace scopes is
+    maintained while walking the dictionary, so inner prefix rebinding,
+    ``xmlns=""`` default-namespace undeclaration, and several prefixes for one
+    URI are restored correctly. Unprefixed attributes are never placed in the
+    default namespace. New elements or attributes whose URI has no usable
+    in-scope prefix receive a non-colliding generated prefix and a local
+    declaration. The legacy global `namespaces` map, when given, acts only as a
+    preferred-prefix hint.
+
     """
     bytes_errors = kwargs.pop('bytes_errors', 'replace')
     try:
         codecs.lookup_error(bytes_errors)
     except LookupError as exc:
         raise ValueError(f"Invalid bytes_errors handler: {bytes_errors}") from exc
+    preserve_namespace_context = kwargs.pop(
+        'preserve_namespace_context', False)
+    attr_prefix = kwargs.get('attr_prefix', '@')
+    cdata_key = kwargs.get('cdata_key', '#text')
+    namespace_separator = kwargs.get('namespace_separator', ':')
+    ns_scope = None
+    if preserve_namespace_context:
+        declared_prefixes = set()
+        for root_value in input_dict.values():
+            declared_prefixes |= _collect_xmlns_prefixes(
+                root_value, attr_prefix, cdata_key)
+        ns_scope = _NamespaceScope(
+            preferred=kwargs.get('namespaces'),
+            ns_sep=namespace_separator,
+            declared_prefixes=declared_prefixes)
 
     must_return = False
     if output is None:
@@ -615,6 +887,8 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             encoding=encoding,
             bytes_errors=bytes_errors,
             comment_key=comment_key,
+            preserve_namespace_context=preserve_namespace_context,
+            ns_scope=ns_scope,
             **kwargs,
         )
         if key != comment_key:
