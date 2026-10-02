@@ -29,6 +29,7 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        subtree_filter=None,
     ):
         self.path = []
         self.stack = []
@@ -49,6 +50,11 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.subtree_filter = subtree_filter
+        # Depth of the subtree currently being skipped (0 = not skipping).
+        # Skipped elements are never pushed onto `self.path`, so the path
+        # stack stays aligned with the elements actually being built.
+        self._skip_depth = 0
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -72,9 +78,14 @@ class _DictSAXHandler:
         return self.dict_constructor(zip(attrs[0::2], attrs[1::2]))
 
     def startNamespaceDecl(self, prefix, uri):
+        if self._skip_depth:
+            return
         self.namespace_declarations[prefix or ''] = uri
 
     def startElement(self, full_name, attrs):
+        if self._skip_depth:
+            self._skip_depth += 1
+            return
         name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
         if self.namespace_declarations:
@@ -83,6 +94,14 @@ class _DictSAXHandler:
             attrs['xmlns'] = self.namespace_declarations
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
+        if self.subtree_filter is not None and not self.subtree_filter(
+                self.path, attrs, len(self.path)):
+            # Rejected: do not build anything for this subtree. The element
+            # is popped from the path again so siblings keep a stable path,
+            # and `_skip_depth` tracks nesting until the matching end tag.
+            self.path.pop()
+            self._skip_depth = 1
+            return
         if len(self.path) >= self.item_depth:
             self.stack.append((self.item, self.data))
             if self.xml_attribs:
@@ -102,6 +121,9 @@ class _DictSAXHandler:
             self.data = []
 
     def endElement(self, full_name):
+        if self._skip_depth:
+            self._skip_depth -= 1
+            return
         name = self._build_name(full_name)
         # If we just closed an item at the streaming depth, emit it and drop it
         # without attaching it back to its parent. This avoids accumulating all
@@ -153,12 +175,19 @@ class _DictSAXHandler:
         self.path.pop()
 
     def characters(self, data):
+        if self._skip_depth:
+            # Character data inside a skipped subtree is dropped; text
+            # before and after the skipped subtree in the parent element
+            # is concatenated as usual (joined with `cdata_separator`).
+            return
         if not self.data:
             self.data = [data]
         else:
             self.data.append(data)
 
     def comments(self, data):
+        if self._skip_depth:
+            return
         if self.strip_whitespace:
             data = data.strip()
         self.item = self.push_data(self.item, self.comment_key, data)
@@ -342,6 +371,27 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    The optional argument `subtree_filter` is a function that decides, at
+    parse time, whether the subtree rooted at an element should be built
+    into the result. It is called right after an element's start tag and
+    attributes have been read, with three positional arguments: the `path`
+    from the document root to (and including) the element as a list of
+    `(name, attributes)` pairs, the element's `attributes` as a dict, and
+    the current `depth` (1 for the root element). Returning a false-ish
+    value skips the whole subtree: no dictionaries are built for it and
+    neither `postprocessor` nor `item_callback` are invoked for anything
+    inside it. Skipped content is still checked for well-formedness by the
+    underlying expat parser and entity handling is unaffected. Character
+    data before and after a skipped subtree is concatenated in the parent
+    element (joined with `cdata_separator`). If the filter itself raises,
+    the exception propagates and parsing stops. Usage example::
+
+        >>> def drop_attachments(path, attrs, depth):
+        ...     return path[-1][0] != 'attachment'
+        >>> xmltodict.parse('<a><b>1</b><attachment><blob/></attachment></a>',
+        ...                 subtree_filter=drop_attachments)
+        {'a': {'b': '1'}}
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
                               **kwargs)

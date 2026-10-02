@@ -720,3 +720,163 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+def _drop_named(*names):
+    def subtree_filter(path, attrs, depth):
+        return path[-1][0] not in names
+    return subtree_filter
+
+
+def test_subtree_filter_skips_subtree():
+    xml = ('<a><keep>1</keep><attachment><blob>x</blob><blob>y</blob>'
+           '</attachment><keep>2</keep></a>')
+    assert parse(xml, subtree_filter=_drop_named('attachment')) == {
+        'a': {'keep': ['1', '2']},
+    }
+
+
+def test_subtree_filter_receives_path_attrs_depth():
+    seen = []
+
+    def subtree_filter(path, attrs, depth):
+        seen.append(([(name, dict(a) if a else None) for name, a in path],
+                     dict(attrs), depth))
+        return True
+
+    xml = '<a x="1"><b y="2"><c>text</c></b></a>'
+    parse(xml, subtree_filter=subtree_filter)
+    assert seen == [
+        ([('a', {'x': '1'})], {'x': '1'}, 1),
+        ([('a', {'x': '1'}), ('b', {'y': '2'})], {'y': '2'}, 2),
+        ([('a', {'x': '1'}), ('b', {'y': '2'}), ('c', None)], {}, 3),
+    ]
+
+
+def test_subtree_filter_builds_no_dicts_for_skipped_subtree():
+    class CountingDict(dict):
+        count = 0
+
+        def __init__(self, *args, **kwargs):
+            CountingDict.count += 1
+            super().__init__(*args, **kwargs)
+
+    blob = '<blob><part>n</part></blob>' * 10000
+    xml = '<a><keep>1</keep><attachment size="huge">{}</attachment></a>'.format(blob)
+    result = parse(xml, subtree_filter=_drop_named('attachment'),
+                   dict_constructor=CountingDict)
+    assert result == {'a': {'keep': '1'}}
+    # Only a small constant number of business containers is built; the
+    # 10000 skipped <blob> subtrees produce nothing.
+    assert CountingDict.count < 100
+
+
+def test_subtree_filter_adjacent_skips_keep_path_aligned():
+    xml = ('<a><skip><x>1</x></skip><keep>a</keep><skip><y>2</y></skip>'
+           '<skip><z>3</z></skip><keep>b</keep></a>')
+    paths = []
+
+    def subtree_filter(path, attrs, depth):
+        paths.append(tuple(name for name, _ in path))
+        return path[-1][0] != 'skip'
+
+    result = parse(xml, subtree_filter=subtree_filter)
+    assert result == {'a': {'keep': ['a', 'b']}}
+    assert paths == [('a',), ('a', 'skip'), ('a', 'keep'), ('a', 'skip'),
+                     ('a', 'skip'), ('a', 'keep')]
+
+
+def test_subtree_filter_concatenates_parent_text():
+    xml = '<a>before<skip><x>1</x></skip>after</a>'
+    assert parse(xml, subtree_filter=_drop_named('skip')) == {
+        'a': 'beforeafter',
+    }
+    assert parse(xml, subtree_filter=_drop_named('skip'),
+                 cdata_separator=' ') == {'a': 'before after'}
+
+
+def test_subtree_filter_no_postprocessor_in_skipped_subtree():
+    calls = []
+
+    def postprocessor(path, key, value):
+        calls.append(key)
+        return key, value
+
+    xml = '<a p="1"><skip q="2"><x>1</x></skip><b>2</b></a>'
+    result = parse(xml, postprocessor=postprocessor,
+                   subtree_filter=_drop_named('skip'))
+    assert result == {'a': {'@p': '1', 'b': '2'}}
+    assert calls == ['@p', 'b', 'a']
+
+
+def test_subtree_filter_malformed_xml_still_errors():
+    xml = '<a><skip><x>1</skip></a>'
+    with pytest.raises(expat.ExpatError):
+        parse(xml, subtree_filter=_drop_named('skip'))
+
+
+def test_subtree_filter_entities_still_disabled():
+    xml = ('<!DOCTYPE a [<!ENTITY x "boom">]>'
+           '<a><skip>&x;</skip></a>')
+    with pytest.raises(ValueError):
+        parse(xml, subtree_filter=_drop_named('skip'))
+
+
+def test_subtree_filter_with_namespaces():
+    xml = ('<a xmlns:n="http://example.com/ns">'
+           '<n:attachment><n:blob>x</n:blob></n:attachment>'
+           '<n:keep>1</n:keep></a>')
+    seen = []
+
+    def subtree_filter(path, attrs, depth):
+        seen.append(path[-1][0])
+        return path[-1][0] != 'http://example.com/ns:attachment'
+
+    result = parse(xml, process_namespaces=True, subtree_filter=subtree_filter)
+    assert result == {
+        'a': {
+            '@xmlns': {'n': 'http://example.com/ns'},
+            'http://example.com/ns:keep': '1',
+        },
+    }
+    # filter sees the expanded (namespaced) element names
+    assert seen == ['a', 'http://example.com/ns:attachment',
+                    'http://example.com/ns:keep']
+
+
+def test_subtree_filter_root_rejected():
+    xml = '<a><b>1</b></a>'
+    assert parse(xml, subtree_filter=lambda path, attrs, depth: False) is None
+
+
+def test_subtree_filter_item_depth_inside_skipped_subtree():
+    items = []
+
+    def item_callback(path, item):
+        items.append((tuple(name for name, _ in path), item))
+        return True
+
+    xml = ('<a><attachment><blob>1</blob><blob>2</blob></attachment>'
+           '<entry><blob>3</blob></entry></a>')
+    parse(xml, item_depth=2, item_callback=item_callback,
+          subtree_filter=_drop_named('attachment'))
+    # <attachment> is skipped entirely: no item_callback for it, and the
+    # streamed <entry> item contains only its own subtree.
+    assert items == [(('a', 'entry'), {'blob': '3'})]
+
+
+def test_subtree_filter_exception_propagates():
+    class FilterError(Exception):
+        pass
+
+    def subtree_filter(path, attrs, depth):
+        if path[-1][0] == 'b':
+            raise FilterError('boom')
+        return True
+
+    with pytest.raises(FilterError):
+        parse('<a><b>1</b><c>2</c></a>', subtree_filter=subtree_filter)
+
+
+def test_subtree_filter_none_by_default():
+    assert parse('<a><b>1</b></a>') == {'a': {'b': '1'}}

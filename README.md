@@ -220,6 +220,7 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `subtree_filter=None`: Function called at parse time, right after an element's start tag and attributes have been read, to decide whether that element's subtree should be built into the result. It receives `(path, attrs, depth)`: the path from the document root to (and including) the element as a list of `(name, attributes)` pairs, the element's attributes as a dict, and the 1-based depth. Returning a false-ish value skips the whole subtree: no dictionaries are built for it, and neither `postprocessor` nor `item_callback` run for anything inside it. Skipped content is still checked for well-formedness by expat and entity handling is unaffected. Text before and after a skipped subtree is concatenated in the parent element (joined with `cdata_separator`). If the filter raises, the exception propagates and parsing stops. If the root element is rejected, `parse` returns `None`.
 
 ### xmltodict.unparse()
 
