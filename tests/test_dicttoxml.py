@@ -778,3 +778,198 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+import xml.etree.ElementTree as ET
+
+
+MULTI_REBIND_XML = """
+<root xmlns="http://default/" xmlns:a="http://a/" xmlns:b="http://a/">
+  <a:x xmlns:a="http://a2/">
+    <a:y xmlns="" plain="p" a:q="1" b:r="2">5</a:y>
+    <child xmlns="http://other/">
+      <leaf a:k="v"/>
+    </child>
+  </a:x>
+</root>
+"""
+
+
+def _clark_signature(xml_text):
+    """Expanded-name (namespace URI, local name) signature per element."""
+    sig = []
+
+    def expanded(name):
+        if name.startswith('{'):
+            uri, local = name[1:].split('}', 1)
+            return (uri, local)
+        return ('', name)
+
+    def walk(elem):
+        sig.append((
+            expanded(elem.tag),
+            tuple(sorted(
+                (expanded(a), v)
+                for a, v in elem.attrib.items()
+            )),
+            (elem.text or '').strip(),
+        ))
+        for child in elem:
+            walk(child)
+
+    walk(ET.fromstring(xml_text))
+    return tuple(sig)
+
+
+def test_unparse_preserves_namespace_context_roundtrip():
+    d = parse(MULTI_REBIND_XML, preserve_namespace_context=True)
+    out = unparse(d, preserve_namespace_context=True)
+    # Standard XML parser must resolve exactly the same expanded names.
+    assert _clark_signature(out) == _clark_signature(MULTI_REBIND_XML)
+
+
+def test_unparse_preserves_namespace_context_modified_tree():
+    d = parse(MULTI_REBIND_XML, preserve_namespace_context=True)
+    x = d['http://default/:root']['http://a2/:x']
+    leaf = x['http://other/:child']['http://other/:leaf']
+    # New node and attribute in a URI not declared on the existing tree.
+    leaf['http://new/:added'] = {'@http://new2/:flag': 'yes', '#text': '7'}
+
+    out = unparse(d, preserve_namespace_context=True)
+    root = ET.fromstring(out)
+
+    # Collect all expanded tags/attrs via Clark notation.
+    tags = []
+    attrs = []
+
+    def walk(elem):
+        tags.append(elem.tag)
+        attrs.extend(elem.attrib.items())
+        for child in elem:
+            walk(child)
+
+    walk(root)
+    assert '{http://new/}added' in tags
+    assert ('{http://new2/}flag', 'yes') in attrs
+    # Pre-existing bindings survive untouched.
+    assert '{http://default/}root' in tags
+    assert ('{http://a2/}q', '1') in attrs
+    assert ('{http://a/}r', '2') in attrs
+    # Unprefixed attribute stays in no namespace.
+    assert ('plain', 'p') in attrs
+    assert not any(a.startswith('{http') for a, _ in [('plain', 'p')])
+
+
+def test_unparse_preserves_namespace_context_prefix_conflict():
+    # Inner element reuses an in-scope prefix for a different URI and also
+    # adds a node whose URI has no declaration anywhere.
+    d = {
+        'http://u1/:root': {
+            '@xmlns': {'a': 'http://u1/'},
+            'http://u2/:x': {
+                '@xmlns': {'a': 'http://u2/'},
+                'http://u3/:y': 'z',
+            },
+        }
+    }
+    out = unparse(d, preserve_namespace_context=True)
+    sig = _clark_signature(out)
+    assert sig == (
+        (('http://u1/', 'root'), (), ''),
+        (('http://u2/', 'x'), (), ''),
+        (('http://u3/', 'y'), (), 'z'),
+    )
+    # The minted prefix must not collide with either binding of 'a'.
+    assert ':y' in _strip(out)
+
+
+def test_unparse_preserves_namespace_context_undeclares_default():
+    d = {
+        'http://u1/:root': {
+            '@xmlns': {'': 'http://u1/'},
+            'child': {
+                '@xmlns': {'': None},
+                'http://u1/:grand': 't',
+            },
+        }
+    }
+    out = unparse(d, preserve_namespace_context=True)
+    root = ET.fromstring(out)
+    assert root.tag == '{http://u1/}root'
+    child = list(root)[0]
+    assert child.tag == 'child'
+    grand = list(child)[0]
+    assert grand.tag == '{http://u1/}grand'
+
+
+def test_unparse_preserves_namespace_context_separator_in_uri():
+    d = {
+        'http://host/ns:1/:root': {
+            '@xmlns': {'': 'http://host/ns:1/'},
+            'http://host/ns:a/:x': '1',
+        }
+    }
+    out = unparse(d, preserve_namespace_context=True)
+    root = ET.fromstring(out)
+    assert root.tag == '{http://host/ns:1/}root'
+    assert root[0].tag == '{http://host/ns:a/}x'
+
+
+def test_unparse_preserves_namespace_context_attribute_never_default():
+    # An attribute whose URI equals the default namespace must still be
+    # emitted with a prefix; unprefixed attributes are in no namespace.
+    d = {
+        'http://u/:r': {
+            '@xmlns': {'': 'http://u/'},
+            '@http://u/:q': '1',
+            '@plain': '2',
+            'c': 't',
+        }
+    }
+    out = unparse(d, preserve_namespace_context=True)
+    root = ET.fromstring(out)
+    assert root.attrib == {'{http://u/}q': '1', 'plain': '2'}
+    # A new no-namespace child undeclares the inherited default namespace.
+    assert root[0].tag == 'c'
+
+
+def test_unparse_preserves_namespace_context_custom_separator():
+    xml = '<r xmlns:a="http://a/"><a:x a:q="1"/></r>'
+    d = parse(xml, preserve_namespace_context=True,
+              attr_prefix='!', namespace_separator='|')
+    assert d == {
+        'r': {
+            '!xmlns': {'a': 'http://a/'},
+            'http://a/|x': {'!http://a/|q': '1'},
+        }
+    }
+    out = unparse(d, preserve_namespace_context=True,
+                  attr_prefix='!', namespace_separator='|')
+    assert _clark_signature(out) == (
+        (('', 'r'), (), ''),
+        (('http://a/', 'x'), ((('http://a/', 'q'), '1'),), ''),
+    )
+
+
+def test_unparse_preserves_namespace_context_rejects_bad_prefix():
+    bad = {'r': {'@xmlns': {'a:b': 'http://x/'}, 'c': '1'}}
+    with pytest.raises(ValueError, match='Invalid namespace prefix'):
+        unparse(bad, preserve_namespace_context=True, full_document=False)
+
+
+def test_unparse_legacy_namespaces_map_still_works():
+    obj = {
+        "http://defaultns.com/:root": {
+            "@xmlns": {
+                "": "http://defaultns.com/",
+                "a": "http://a.com/",
+            },
+            "http://a.com/:y": "2",
+        },
+    }
+    xml = unparse(obj, namespaces={'http://a.com/': 'a'})
+    assert '<a:y>2</a:y>' in xml
+    assert _clark_signature(xml) == (
+        (('http://defaultns.com/', 'root'), (), ''),
+        (('http://a.com/', 'y'), (), '2'),
+    )

@@ -720,3 +720,55 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+MULTI_REBIND_XML = """
+<root xmlns="http://default/" xmlns:a="http://a/" xmlns:b="http://a/">
+  <a:x xmlns:a="http://a2/">
+    <a:y xmlns="" plain="p" a:q="1" b:r="2">5</a:y>
+    <child xmlns="http://other/">
+      <leaf a:k="v"/>
+    </child>
+  </a:x>
+</root>
+"""
+
+
+def test_preserve_namespace_context_captures_per_element_decls():
+    d = parse(MULTI_REBIND_XML, preserve_namespace_context=True)
+    root = d['http://default/:root']
+    assert root['@xmlns'] == {
+        '': 'http://default/',
+        'a': 'http://a/',
+        'b': 'http://a/',
+    }
+    x = root['http://a2/:x']
+    assert x['@xmlns'] == {'a': 'http://a2/'}
+    y = x['http://a2/:y']
+    # Undeclaring the default namespace is preserved verbatim.
+    assert y['@xmlns'] == {'': None}
+    # Unprefixed attributes are in no namespace even inside a default ns.
+    assert '@plain' in y
+    # Prefixed attributes carry their expanded URI identity.
+    assert y['@http://a2/:q'] == '1'
+    assert y['@http://a/:r'] == '2'
+    other_child = x['http://other/:child']
+    leaf = other_child['http://other/:leaf']
+    assert leaf['@http://a2/:k'] == 'v'
+
+
+def test_preserve_namespace_context_keeps_expanded_names():
+    d = parse(MULTI_REBIND_XML, preserve_namespace_context=True,
+              namespaces={'http://a/': 'a'})
+    names = list(d['http://default/:root'])
+    assert 'http://a2/:x' in names
+    x = d['http://default/:root']['http://a2/:x']
+    assert set(x) == {'@xmlns', 'http://a2/:y', 'http://other/:child'}
+
+
+def test_preserve_namespace_context_uri_with_separator():
+    xml = ('<root xmlns="http://host/ns:1/" '
+           'xmlns:a="http://host/ns:a/"><a:x>1</a:x></root>')
+    d = parse(xml, preserve_namespace_context=True)
+    root = d['http://host/ns:1/:root']
+    assert root['http://host/ns:a/:x'] == '1'
