@@ -194,6 +194,49 @@ Lists that are specified under a key in a dictionary use the key as a tag for ea
 </line>
 ```
 
+## Mixed content
+
+By default, `parse()` collects an element's text into a single `#text` entry,
+so the relative order of text and child elements is lost for mixed content
+such as `<p>Hello <b>world</b>!</p>`. Passing `mixed_content=True` preserves
+that order. Each element becomes a dict with its attributes (using
+`attr_prefix`, as usual) plus a `'#children'` key whose value is a list of
+the element's content in document order: text nodes are plain strings and
+child elements are single-key dicts of the same shape:
+
+```python
+>>> import xmltodict
+>>> xmltodict.parse('<p>Hello <b>world</b>!</p>', mixed_content=True)
+{'p': {'#children': ['Hello ', {'b': {'#children': ['world']}}, '!']}}
+```
+
+Rules of the mixed content representation:
+
+- Text nodes (including CDATA sections) are plain strings; adjacent text is
+  merged. Character data is kept verbatim: `strip_whitespace` does not apply
+  to text in this mode.
+- Child elements are single-key dicts; repeated siblings simply appear as
+  consecutive entries in the `'#children'` list, so `force_list` is not
+  needed (and not supported) in this mode.
+- Empty elements are represented as empty dicts (`{'br': {}}`).
+- Attributes keep their `attr_prefix`-prefixed form; namespace handling
+  follows the same rules as the default mode.
+- Comments appear as `{comment_key: text}` entries in `'#children'` when
+  `process_comments=True`.
+- `cdata_key`, `comment_key` and `attr_prefix` must not collide with the
+  `'#children'` key; conflicting values raise `ValueError`, as do
+  `postprocessor`, `force_list` and `force_cdata`.
+
+The result round-trips through `unparse(..., mixed_content=True)` (pretty
+printing is not supported in this mode, since the inserted whitespace would
+alter the content):
+
+```python
+>>> doc = xmltodict.parse('<p>a<br/>b</p>', mixed_content=True)
+>>> xmltodict.unparse(doc, mixed_content=True, full_document=False)
+'<p>a<br></br>b</p>'
+```
+
 ## API Reference
 
 ### xmltodict.parse()
@@ -220,6 +263,7 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `mixed_content=False`: Preserve the order of text nodes and child elements using the `'#children'` list convention described in [Mixed content](#mixed-content). Incompatible with `postprocessor`, `force_list` and `force_cdata`.
 
 ### xmltodict.unparse()
 
@@ -237,13 +281,14 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `mixed_content=False`: Interpret `input_dict` using the mixed content convention produced by `parse(..., mixed_content=True)`. Not compatible with `pretty`, `preprocessor` or `expand_iter`.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
 > placeholder child (for example, `{'a': ['']}`) if an explicit empty container
 > element is required in the output.
 
-Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
+Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, multiple top-level comments). Mixed content ordering is preserved only when opting in with `mixed_content=True`. For exact fidelity, use a full XML library such as lxml.
 
 ## Examples
 
