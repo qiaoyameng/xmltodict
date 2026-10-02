@@ -194,6 +194,64 @@ Lists that are specified under a key in a dictionary use the key as a tag for ea
 </line>
 ```
 
+## Mixed content mode
+
+By default, text and child elements are stored separately (`#text` holds all
+the concatenated text), so the interleaving order is lost for documents like
+`<p>前面<b>重点</b>中间</p>`. Pass `mixed_content=True` to `parse()` to keep
+that order. Every element that contains child elements is represented as a
+dict with an ordered `content_key` list (default key `'#content'`):
+
+```python
+>>> xmltodict.parse('<p>前面<b>重点</b>中间<i>补充</i>后面</p>',
+...                 mixed_content=True)
+{'p': {'#content': ['前面', ('b', '重点'), '中间', ('i', '补充'), '后面']}}
+```
+
+The list items are:
+
+- a string for a text fragment (CDATA sections are merged with ordinary
+  text; entity spelling is not restored);
+- a `(tag, value)` tuple for one child element. Repeated tuples with the
+  same tag represent adjacent same-name siblings.
+
+Attributes stay on the same dict under `attr_prefix` keys. Leaf elements
+(no children) keep the classic representation: plain text, `None` for empty
+elements, or an attributes/`#text` dict:
+
+```python
+>>> xmltodict.parse('<p>x<b id="1">bold</b><b>two</b>y</p>',
+...                 mixed_content=True)
+{'p': {'#content': ['x',
+                    ('b', {'@id': '1', '#text': 'bold'}),
+                    ('b', 'two'),
+                    'y']}}
+```
+
+Rules and conventions:
+
+- `unparse()` accepts this representation with no extra flag (single-key
+  dicts like `{'b': 'x'}` are also accepted as child items for convenience):
+  `unparse(parse(xml, mixed_content=True))` round-trips the document
+  semantically.
+- Whitespace: text fragments containing non-whitespace characters are always
+  kept verbatim (including surrounding spaces). Whitespace-only fragments
+  are dropped with the default `strip_whitespace=True` and kept when it is
+  `False`.
+- Empty child elements are `(tag, None)`; an element with attributes but no
+  children is a plain attributes dict.
+- Namespaces work exactly as in the default mode
+  (`process_namespaces`/`namespaces`), in both `parse` and `unparse`.
+- `force_list` has no additional effect: each child is already a separate
+  ordered item.
+- `content_key` (configurable) must differ from `cdata_key` and must not
+  start with `attr_prefix`, and an element using it cannot also carry
+  `cdata_key` or regular child keys; otherwise a `ValueError` is raised.
+- Comments (`process_comments=True`) remain on the element dict under
+  `comment_key`; their position inside mixed content is not tracked.
+- The default mode is unchanged: without `mixed_content=True`, return types
+  and values are exactly as before.
+
 ## API Reference
 
 ### xmltodict.parse()
@@ -207,6 +265,8 @@ Parse XML input into a Python dictionary.
 - `namespace_separator=':'`: Separator between namespace URI and local name.
 - `disable_entities=True`: Disable entity parsing for security.
 - `process_comments=False`: Include XML comments if True. Comments can be preserved when enabled, but by default they are ignored. Multiple top-level comments may not be preserved in exact order.
+- `mixed_content=False`: Preserve the interleaving order of text and child elements. When True, elements with children use an ordered `content_key` list of text strings and `(tag, value)` tuples; leaf elements keep the classic representation.
+- `content_key='#content'`: Key of the ordered content list used when `mixed_content=True`. Must differ from `cdata_key` and must not start with `attr_prefix`.
 - `xml_attribs=True`: Include attributes in output dict (with `attr_prefix`).
 - `attr_prefix='@'`: Prefix for XML attributes in the dict.
 - `cdata_key='#text'`: Key for text content in the dict.
@@ -233,6 +293,7 @@ Convert a Python dictionary back into XML.
 - `short_empty_elements=False`: Use short tags for empty elements (`<tag/>`).
 - `attr_prefix='@'`: Prefix for dictionary keys representing attributes.
 - `cdata_key='#text'`: Key for text content in the dictionary.
+- `content_key='#content'`: Key for ordered mixed-content lists, as produced by `parse(..., mixed_content=True)`. Its value is a list of text strings and `(tag, value)` child pairs; it must not be combined with `cdata_key` or regular child keys in the same dict.
 - `pretty=False`: Pretty-print the XML output. This adds indentation/newlines for readability, so it should generally not be combined with parsed whitespace-preserving content when exact round-tripping matters.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.

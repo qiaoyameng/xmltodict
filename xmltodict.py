@@ -12,6 +12,25 @@ class ParsingInterrupted(Exception):
     pass
 
 
+DEFAULT_MIXED_CONTENT_KEY = '#content'
+_DROP = object()
+
+
+def _validate_content_key(content_key, cdata_key, attr_prefix):
+    """Validate the key used for ordered mixed-content lists."""
+    if not isinstance(content_key, str) or not content_key:
+        raise ValueError("content_key must be a non-empty string")
+    if content_key == cdata_key:
+        raise ValueError(
+            "content_key must differ from cdata_key "
+            "(%r)" % cdata_key)
+    if content_key.startswith(attr_prefix):
+        raise ValueError(
+            "content_key must not start with attr_prefix "
+            "(%r)" % attr_prefix)
+    return content_key
+
+
 class _DictSAXHandler:
     def __init__(
         self,
@@ -29,10 +48,13 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        mixed_content=False,
+        content_key=DEFAULT_MIXED_CONTENT_KEY,
     ):
         self.path = []
         self.stack = []
         self.data = []
+        self.content = []
         self.item = None
         self.item_depth = item_depth
         self.xml_attribs = xml_attribs
@@ -49,6 +71,8 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.mixed_content = mixed_content
+        self.content_key = content_key
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -82,9 +106,12 @@ class _DictSAXHandler:
                 attrs = self.dict_constructor()
             attrs['xmlns'] = self.namespace_declarations
             self.namespace_declarations = self.dict_constructor()
+        if self.mixed_content:
+            # Any pending text belongs to the parent and precedes this child.
+            self._flush_pending_text()
         self.path.append((name, attrs or None))
         if len(self.path) >= self.item_depth:
-            self.stack.append((self.item, self.data))
+            self.stack.append((self.item, self.data, self.content))
             if self.xml_attribs:
                 attr_entries = []
                 for key, value in attrs.items():
@@ -100,9 +127,14 @@ class _DictSAXHandler:
                 attrs = None
             self.item = attrs or None
             self.data = []
+            if self.mixed_content:
+                self.content = []
 
     def endElement(self, full_name):
         name = self._build_name(full_name)
+        if self.mixed_content:
+            self._end_element_mixed(name)
+            return
         # If we just closed an item at the streaming depth, emit it and drop it
         # without attaching it back to its parent. This avoids accumulating all
         # streamed items in memory when using item_depth > 0.
@@ -126,7 +158,7 @@ class _DictSAXHandler:
             # Reset state for the parent context without keeping a reference to
             # the emitted item.
             if self.stack:
-                self.item, self.data = self.stack.pop()
+                self.item, self.data, _content = self.stack.pop()
             else:
                 self.item = None
                 self.data = []
@@ -136,7 +168,7 @@ class _DictSAXHandler:
             data = (None if not self.data
                     else self.cdata_separator.join(self.data))
             item = self.item
-            self.item, self.data = self.stack.pop()
+            self.item, self.data, _content = self.stack.pop()
             if self.strip_whitespace and data:
                 data = data.strip() or None
             if data and self._should_force_cdata(name, data) and item is None:
@@ -151,6 +183,120 @@ class _DictSAXHandler:
             self.item = None
             self.data = []
         self.path.pop()
+
+    def _pending_text(self):
+        """Return the accumulated text for the current element, or None."""
+        if not self.data:
+            return None
+        data = self.cdata_separator.join(self.data)
+        if self.strip_whitespace and not data.strip():
+            # Whitespace-only runs follow strip_whitespace; text fragments
+            # containing non-whitespace characters are always kept verbatim.
+            return None
+        return data
+
+    def _flush_pending_text(self):
+        """Move the current element's pending text into its ordered content."""
+        data = self._pending_text()
+        if data is not None:
+            if self.postprocessor is not None:
+                result = self.postprocessor(self.path, self.cdata_key, data)
+                if result is not None:
+                    _pkey, pvalue = result
+                    if pvalue is not None:
+                        self.content.append(pvalue)
+            else:
+                self.content.append(data)
+        self.data = []
+
+    def _end_element_mixed(self, name):
+        """endElement implementation for mixed_content mode."""
+        is_stream_item = (self.item_depth > 0
+                          and len(self.path) == self.item_depth)
+        self._flush_pending_text()
+        item = self.item
+        content = self.content
+        if is_stream_item:
+            value = self._build_mixed_value(name, item, content)
+            # Emit the item and drop it instead of attaching it to the parent.
+            should_continue = self.item_callback(self.path, value)
+            if not should_continue:
+                raise ParsingInterrupted
+            if self.stack:
+                self.item, self.data, self.content = self.stack.pop()
+            else:
+                self.item = None
+                self.data = []
+                self.content = []
+            self.path.pop()
+            return
+        if self.stack:
+            self.item, self.data, self.content = self.stack.pop()
+            # The stack is restored to the parent context, but self.path still
+            # contains this element, so postprocessors see the same path as in
+            # the classic mode.
+            value = self._build_mixed_value(name, item, content)
+            if self.postprocessor is not None:
+                result = self.postprocessor(self.path, name, value)
+                if result is None:
+                    value = _DROP
+                else:
+                    name, value = result
+            if value is not _DROP:
+                self.content.append((name, value))
+            if not self.stack:
+                # Back at document level: group the top-level element(s).
+                document = self.dict_constructor()
+                for child_name, child_value in self.content:
+                    try:
+                        existing = document[child_name]
+                        if isinstance(existing, list):
+                            existing.append(child_value)
+                        else:
+                            document[child_name] = [existing, child_value]
+                    except KeyError:
+                        document[child_name] = child_value
+                self.item = document
+                self.content = []
+        else:
+            value = self._build_mixed_value(name, item, content)
+            self.item = value
+            self.data = []
+            self.content = []
+        self.path.pop()
+
+    def _build_mixed_value(self, name, item, content):
+        """Build a leaf/element value from its attributes and ordered content.
+
+        Leaf elements (no child elements) keep the classic representation:
+        plain text, ``None`` for empty elements, or an attributes dict.
+        Elements with child elements keep an ordered ``content_key`` list
+        so that sibling and text order is preserved.
+        """
+        text_entries = []
+        child_entries = []
+        for entry in content:
+            if isinstance(entry, tuple):
+                child_entries.append(entry)
+            else:
+                text_entries.append(entry)
+        if not child_entries:
+            if not content:
+                return item
+            data = self.cdata_separator.join(text_entries)
+            if data and self._should_force_cdata(name, data) and item is None:
+                item = self.dict_constructor()
+            if item is not None:
+                if data:
+                    item[self.cdata_key] = data
+                return item
+            return data
+        # The element contains child elements: their order relative to text
+        # and to each other is preserved in the ordered content list.
+        ordered = list(content)
+        result = item if item is not None else self.dict_constructor()
+        result[self.content_key] = ordered
+        return result
 
     def characters(self, data):
         if not self.data:
@@ -206,7 +352,8 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          mixed_content=False, content_key=DEFAULT_MIXED_CONTENT_KEY, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -342,8 +489,44 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    If `mixed_content` is `True` (default `False`), the order of text and
+    child elements is preserved for every element that contains child
+    elements. Such an element is a dict whose `content_key` (default
+    `'#content'`) value is an ordered list of content items:
+
+    * a plain string holds a text fragment (CDATA sections are merged into
+      ordinary text);
+    * a `(tag, value)` tuple holds one child element. Repeated tuples with the
+      same tag represent repeated sibling elements.
+
+    Attributes remain ordinary `attr_prefix` keys on the same dict.
+    Leaf elements keep the usual representation (plain text, `None` for empty
+    elements, an attributes dict, or `cdata_key` text with attributes)::
+
+        >>> xmltodict.parse('<p>before<b>bold</b>after</p>',
+        ...                 mixed_content=True)
+        {'p': {'#content': ['before', ('b', 'bold'), 'after']}}
+
+        >>> xmltodict.parse('<a><b>1</b><c>2</c></a>', mixed_content=True)
+        {'a': {'#content': [('b', '1'), ('c', '2')]}}
+
+    Text fragments that contain non-whitespace characters are always kept
+    verbatim; whitespace-only fragments are kept only when `strip_whitespace`
+    is `False`. The representation is accepted by `unparse` without any flag;
+    single-key dicts are also accepted as child items for convenience.
+    `force_list` has no additional effect in this representation because each
+    child is already a separate ordered entry. `content_key` must differ from
+    `cdata_key` and must not start with `attr_prefix`; otherwise a
+    `ValueError` is raised.
     """
+    if mixed_content:
+        attr_prefix = kwargs.get('attr_prefix', '@')
+        cdata_key = kwargs.get('cdata_key', '#text')
+        _validate_content_key(content_key, cdata_key, attr_prefix)
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              mixed_content=mixed_content,
+                              content_key=content_key,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
@@ -447,6 +630,52 @@ def _process_namespace(name, namespaces, ns_sep=':', attr_prefix='@'):
     return name
 
 
+def _normalize_ordered_content(content, parent_key, content_key):
+    """Normalize a mixed-content list into ``(items, text_fragments)``.
+
+    Each item is either a text fragment (string) or a ``(tag, value)``
+    child-element tuple. A single-key dict ``{tag: value}`` is also accepted
+    for convenience. Non-string scalars are stringified like ordinary
+    character data.
+    """
+    if not isinstance(content, (list, tuple)):
+        raise ValueError(
+            "%r value of element %r must be a list"
+            % (content_key, parent_key))
+    items = []
+    texts = []
+    for item in content:
+        if item is None:
+            raise ValueError(
+                "None is not a valid %r item of element %r"
+                % (content_key, parent_key))
+        if isinstance(item, (str, bytes, bytearray, memoryview)):
+            text = _convert_value_to_string(item)
+        elif isinstance(item, tuple):
+            if len(item) != 2 or not isinstance(item[0], str):
+                raise ValueError(
+                    "child items in %r of element %r must be (tag, value) "
+                    "pairs" % (content_key, parent_key))
+            items.append(item)
+            continue
+        elif isinstance(item, dict):
+            if len(item) != 1:
+                raise ValueError(
+                    "dict items in %r of element %r must contain exactly "
+                    "one child key" % (content_key, parent_key))
+            items.append(next(iter(item.items())))
+            continue
+        elif isinstance(item, (int, float, bool)):
+            text = _convert_value_to_string(item)
+        else:
+            raise ValueError(
+                "unsupported %r item type for element %r: %r"
+                % (content_key, parent_key, type(item).__name__))
+        items.append(text)
+        texts.append(text)
+    return items, texts
+
+
 def _emit(key, value, content_handler,
           attr_prefix='@',
           cdata_key='#text',
@@ -461,7 +690,8 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          content_key=DEFAULT_MIXED_CONTENT_KEY):
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -487,6 +717,7 @@ def _emit(key, value, content_handler,
         if result is None:
             return
         key, value = result
+    _validate_content_key(content_key, cdata_key, attr_prefix)
     # Minimal validation to avoid breaking out of tag context
     _validate_name(key, "element")
     if not hasattr(value, '__iter__') or isinstance(value, (str, bytes, bytearray, memoryview, dict)):
@@ -506,12 +737,15 @@ def _emit(key, value, content_handler,
         cdata = None
         attrs = {}
         children = []
+        ordered_content = v.get(content_key) if content_key in v else None
         for ik, iv in v.items():
             if ik == cdata_key:
                 if iv is None:
                     cdata = None
                 else:
                     cdata = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
+                continue
+            if ik == content_key:
                 continue
             if isinstance(ik, str) and ik.startswith(attr_prefix):
                 ik = _process_namespace(ik, namespaces, namespace_separator,
@@ -534,24 +768,71 @@ def _emit(key, value, content_handler,
                 continue
             if isinstance(iv, list) and not iv:
                 continue # Skip empty lists to avoid creating empty child elements
+            if ordered_content is not None and isinstance(ik, str) \
+                    and ik == comment_key:
+                # Comments are metadata, like attributes; their position
+                # relative to ordered content is not tracked. Emit them first.
+                comments_list = iv if isinstance(iv, list) else [iv]
+                children.append((comment_key, comments_list))
+                continue
             children.append((ik, iv))
+        if ordered_content is not None:
+            if [c for c in children if c[0] != comment_key]:
+                raise ValueError(
+                    "%r elements cannot mix %r with other child keys"
+                    % (key, content_key))
+            if cdata is not None:
+                raise ValueError(
+                    "%r elements cannot use both %r and %r"
+                    % (key, content_key, cdata_key))
         if isinstance(indent, int):
             indent = ' ' * indent
         if pretty:
             content_handler.ignorableWhitespace(depth * indent)
         content_handler.startElement(key, AttributesImpl(attrs))
-        if pretty and children:
+        if ordered_content is not None:
+            for child_key, child_value in children:
+                if child_key == comment_key:
+                    _emit(child_key, child_value, content_handler,
+                          attr_prefix, cdata_key, depth+1, preprocessor,
+                          pretty, newl, indent, namespaces=namespaces,
+                          namespace_separator=namespace_separator,
+                          expand_iter=expand_iter, encoding=encoding,
+                          bytes_errors=bytes_errors, comment_key=comment_key,
+                          content_key=content_key)
+            emit_items, emit_texts = _normalize_ordered_content(
+                ordered_content, key, content_key)
+            has_text = bool(emit_texts)
+            if pretty and emit_items and not has_text:
+                content_handler.ignorableWhitespace(newl)
+            for item in emit_items:
+                if isinstance(item, str):
+                    content_handler.characters(item)
+                else:
+                    child_key, child_value = item
+                    _emit(child_key, child_value, content_handler,
+                          attr_prefix, cdata_key, depth+1, preprocessor,
+                          pretty and not has_text, newl, indent,
+                          namespaces=namespaces,
+                          namespace_separator=namespace_separator,
+                          expand_iter=expand_iter, encoding=encoding,
+                          bytes_errors=bytes_errors, comment_key=comment_key,
+                          content_key=content_key)
+            if pretty and emit_items and not has_text:
+                content_handler.ignorableWhitespace(depth * indent)
+        elif pretty and children:
             content_handler.ignorableWhitespace(newl)
-        for child_key, child_value in children:
-            _emit(child_key, child_value, content_handler,
-                  attr_prefix, cdata_key, depth+1, preprocessor,
-                  pretty, newl, indent, namespaces=namespaces,
-                  namespace_separator=namespace_separator,
-                  expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
-        if cdata is not None:
+        if ordered_content is None:
+            for child_key, child_value in children:
+                _emit(child_key, child_value, content_handler,
+                      attr_prefix, cdata_key, depth+1, preprocessor,
+                      pretty, newl, indent, namespaces=namespaces,
+                      namespace_separator=namespace_separator,
+                      expand_iter=expand_iter, encoding=encoding,
+                      bytes_errors=bytes_errors, comment_key=comment_key)
+        if cdata is not None and ordered_content is None:
             content_handler.characters(cdata)
-        if pretty and children:
+        if pretty and children and ordered_content is None:
             content_handler.ignorableWhitespace(depth * indent)
         content_handler.endElement(key)
         if pretty and depth:
@@ -566,6 +847,7 @@ class _XMLGenerator(XMLGenerator):
 
 def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             short_empty_elements=False, comment_key='#comment',
+            content_key=DEFAULT_MIXED_CONTENT_KEY,
             **kwargs):
     """Emit an XML document for the given `input_dict` (reverse of `parse`).
 
@@ -579,6 +861,12 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     Empty lists are omitted entirely: ``{"a": []}`` produces no ``<a>`` element.
     Provide a placeholder entry (for example ``{"a": [""]}``) when an explicit
     empty container element must be emitted.
+
+    Mixed content produced by ``parse(..., mixed_content=True)`` is accepted
+    transparently: an ordered ``content_key`` (default ``'#content'``) list may
+    contain text fragments (strings) and ``(tag, value)`` child pairs in any
+    interleaving. Such an element may not also contain regular child keys or
+    the ``cdata_key``.
 
     The `pretty` parameter (default=`False`) enables pretty-printing. In this
     mode, lines are terminated with `'\n'` and indented with `'\t'`, but this
@@ -615,6 +903,7 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             encoding=encoding,
             bytes_errors=bytes_errors,
             comment_key=comment_key,
+            content_key=content_key,
             **kwargs,
         )
         if key != comment_key:
