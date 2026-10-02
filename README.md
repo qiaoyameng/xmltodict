@@ -127,6 +127,45 @@ $ gunzip enwiki.dicts.gz | script2.py
 ...
 ```
 
+## Skipping subtrees at parse time
+
+When a document contains large subtrees you never need (for example,
+base64 attachment payloads), pass `subtree_filter` to decide at parse
+time, right after an element's start tag and attributes are read, whether
+its subtree should be built. Skipped markup is still parsed by Expat, so
+well-formedness and entity checks remain active, but no business
+dictionaries are allocated for it and `postprocessor`/`item_callback` are
+not invoked inside it.
+
+The filter receives the expanded `path` (including the starting element),
+that element's raw `attrs` (a dict, including `xmlns` declarations), and
+the 1-based `depth`. Return false to skip:
+
+```python
+>>> xml = '''
+... <order id="42">
+...   <item>widget</item>
+...   <attachment size="1048576"><chunk>...</chunk></attachment>
+... </order>'''
+>>> def keep(path, attrs, depth):
+...     return path[-1][0] != 'attachment'
+>>> xmltodict.parse(xml, subtree_filter=keep)
+{'order': {'@id': '42', 'item': 'widget'}}
+```
+
+Text immediately before and after a skipped subtree is kept as separate
+CDATA segments on the parent (joined with `cdata_separator`, trimmed with
+`strip_whitespace`), exactly as it is around a normal child element:
+
+```python
+>>> no_skip = lambda path, attrs, depth: path[-1][0] != 'skip'
+>>> xmltodict.parse('<a>before<skip/>after</a>', subtree_filter=no_skip)
+{'a': 'beforeafter'}
+```
+
+The filter is not called again for descendants of a skipped element, and
+any exception it raises aborts the parse and propagates unchanged.
+
 ## Roundtripping
 
 You can also convert in the other direction, using the `unparse()` method:
@@ -219,6 +258,7 @@ Parse XML input into a Python dictionary.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
+- `subtree_filter=None`: Optional callable invoked at parse time, right after an element start tag and its attributes have been read but before the subtree is built. It receives `(path, attrs, depth)`: the `path` is the list of `(name, attrs)` pairs from the root to the starting element (the element itself is last), `attrs` is a dict of the element's raw attribute values with namespace processing applied to names (including the synthesized `xmlns` declarations), and `depth` is the 1-based element depth (`len(path)`). Return a false-ish value to skip the whole subtree: no business dictionaries are built and neither `postprocessor` nor `item_callback` runs inside it; Expat still parses the skipped markup (malformed XML and the `disable_entities` security setting are enforced), and the parent's text before/after the subtree is split into CDATA segments just like around a normal child element. Any exception raised by the filter aborts the parse and propagates unchanged.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
 
 ### xmltodict.unparse()
